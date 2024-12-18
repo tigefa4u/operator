@@ -5,13 +5,14 @@ commonAnnotations:
   operator.min.io/authors: "MinIO, Inc."
   operator.min.io/license: "AGPLv3"
   operator.min.io/support: "https://subnet.min.io"
-
+  operator.min.io/version: v6.0.4
+commonLabels:
+  app.kubernetes.io/name: operator
 resources:
   - base/namespace.yaml
   - base/service-account.yaml
   - base/cluster-role.yaml
   - base/cluster-role-binding.yaml
-  - base/crds/minio.min.io_tenants.yaml
+  - base/crds/
   - base/service.yaml
   - base/deployment.yaml
-  - base/console-ui.yaml

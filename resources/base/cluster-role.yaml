@@ -22,6 +22,7 @@ rules:
       - ""
     resources:
       - namespaces
+      - nodes
     verbs:
       - get
       - watch
@@ -54,6 +55,31 @@ rules:
       - list
       - delete
       - deletecollection
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - roles
+      - rolebindings
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
   - apiGroups:
       - apps
     resources:
@@ -91,19 +117,29 @@ rules:
       - create
       - get
       - delete
+      - list
   - apiGroups:
       - certificates.k8s.io
     resourceNames:
       - kubernetes.io/legacy-unknown
       - kubernetes.io/kube-apiserver-client
       - kubernetes.io/kubelet-serving
+      - beta.eks.amazonaws.com/app-serving
     resources:
       - signers
     verbs:
       - approve
       - sign
   - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+  - apiGroups:
       - minio.min.io
+      - sts.min.io
+      - job.min.io
     resources:
       - "*"
     verbs:
@@ -128,3 +164,15 @@ rules:
       - get
       - update
       - create
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - deletecollection

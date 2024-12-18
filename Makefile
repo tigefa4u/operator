@@ -6,44 +6,46 @@ VERSION ?= $(shell git describe --tags)
 VERSIONV ?= $(shell git describe --tags | sed 's,v,,g')
 endif
 TAG ?= "minio/operator:$(VERSION)"
-LDFLAGS ?= "-s -w -X main.Version=$(VERSION)"
-TMPFILE := $(shell mktemp)
+SHA ?= $(shell git rev-parse --short HEAD)
+LDFLAGS ?= "-s -w -X github.com/minio/operator/pkg.ReleaseTag=$(VERSIONV) -X github.com/minio/operator/pkg.Version=$(VERSION) -X github.com/minio/operator/pkg.ShortCommitID=$(SHA)"
 GOPATH := $(shell go env GOPATH)
 GOARCH := $(shell go env GOARCH)
 GOOS := $(shell go env GOOS)
 
 HELM_HOME=helm/operator
-HELM_CRDS=$(HELM_HOME)/crds
+HELM_TEMPLATES=$(HELM_HOME)/templates
 
 KUSTOMIZE_HOME=resources
 KUSTOMIZE_CRDS=$(KUSTOMIZE_HOME)/base/crds/
 
-PLUGIN_HOME=kubectl-minio
-
-LOGSEARCHAPI=logsearchapi
 
 all: build
 
 getdeps:
 	@echo "Checking dependencies"
 	@mkdir -p ${GOPATH}/bin
-	@which golangci-lint 1>/dev/null || (echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.43.0)
-	@echo "Go Mod Download"
-	@go mod download
+	@echo "Installing golangci-lint" && \
+		go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.51.2 && \
+		echo "Installing govulncheck" && \
+		go install golang.org/x/vuln/cmd/govulncheck@latest &&\
+		echo "installing gopls" && \
+		go install golang.org/x/tools/gopls@latest
 
-verify: getdeps govet gotest lint
+verify: getdeps govet lint
 
-operator:
-	@CGO_ENABLED=0 GOOS=linux go build -trimpath --ldflags $(LDFLAGS) -o minio-operator
+binary:
+	@CGO_ENABLED=0 GOOS=linux go build -trimpath --ldflags $(LDFLAGS) -o minio-operator ./cmd/operator
 
-docker:
-	@docker build -t $(TAG) .
+operator: binary
 
-build: regen-crd verify plugin logsearchapi operator docker
+docker: operator
+	@docker buildx build --no-cache --load --platform linux/$(GOARCH) -t $(TAG) .
+
+build: regen-crd verify operator docker
 
 install: all
 
-lint:
+lint: getdeps
 	@echo "Running $@ check"
 	@GO111MODULE=on ${GOPATH}/bin/golangci-lint run --timeout=5m --config ./.golangci.yml
 
@@ -53,6 +55,9 @@ govet:
 gotest:
 	@go test -race ./...
 
+vulncheck:
+	@${GOPATH}/bin/govulncheck ./...
+
 clean:
 	@echo "Cleaning up all the generated files"
 	@find . -name '*.test' | xargs rm -fv
@@ -61,47 +66,30 @@ clean:
 	@rm -rf dist/
 
 regen-crd:
-	@go install -v github.com/minio/controller-tools/cmd/controller-gen@v0.4.7
-	@echo "WARNING: installing our fork github.com/minio/controller-tools/cmd/controller-gen@v0.4.7"
-	@echo "Any other controller-gen will cause the generated CRD to lose the volumeClaimTemplate metadata to be lost"
-	@${GOPATH}/bin/controller-gen crd:maxDescLen=0,generateEmbeddedObjectMeta=true paths="./..." output:crd:artifacts:config=$(KUSTOMIZE_CRDS)
-	@kustomize build resources/patch-crd > $(TMPFILE)
-	@mv -f $(TMPFILE) resources/base/crds/minio.min.io_tenants.yaml
-	@cp -f resources/base/crds/minio.min.io_tenants.yaml $(HELM_CRDS)/minio.min.io_tenants.yaml
+	@go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5
+	@${GOPATH}/bin/controller-gen crd:maxDescLen=0,generateEmbeddedObjectMeta=true webhook paths="./..." output:crd:artifacts:config=$(KUSTOMIZE_CRDS)
+	@sed 's#namespace: minio-operator#namespace: {{ .Release.Namespace }}#g' resources/base/crds/minio.min.io_tenants.yaml > $(HELM_TEMPLATES)/minio.min.io_tenants.yaml
+	@sed 's#namespace: minio-operator#namespace: {{ .Release.Namespace }}#g' resources/base/crds/sts.min.io_policybindings.yaml > $(HELM_TEMPLATES)/sts.min.io_policybindings.yaml
 
 regen-crd-docs:
-	@which crd-ref-docs 1>/dev/null || (echo "Installing crd-ref-docs" && GO111MODULE=on go install -v github.com/elastic/crd-ref-docs@latest)
-	@${GOPATH}/bin/crd-ref-docs --source-path=./pkg/apis/minio.min.io/v2 --config=docs/templates/config.yaml --renderer=asciidoctor --output-path=docs/crd.adoc --templates-dir=docs/templates/asciidoctor/
-
-plugin: regen-crd
-	@echo "Building 'kubectl-minio' binary"
-	@(cd $(PLUGIN_HOME); \
-		go vet ./... && \
-		go test -race ./... && \
-		GO111MODULE=on ${GOPATH}/bin/golangci-lint cache clean && \
-		GO111MODULE=on ${GOPATH}/bin/golangci-lint run --timeout=5m --config ../.golangci.yml)
-
-.PHONY: logsearchapi
-logsearchapi:
-	@echo "Building 'logsearchapi' binary"
-	@(cd $(LOGSEARCHAPI); \
-		go vet ./... && \
-		go test -race ./... && \
-		GO111MODULE=on ${GOPATH}/bin/golangci-lint cache clean && \
-		GO111MODULE=on ${GOPATH}/bin/golangci-lint run --timeout=5m --config ../.golangci.yml && \
-		CGO_ENABLED=0 GOOS=linux go build --ldflags "-s -w" -trimpath -o ../logsearchapi-bin )
-
-getconsoleuiyaml:
-	@echo "Getting the latest Console UI"
-	@kustomize build github.com/minio/console/k8s/operator-console/base > resources/base/console-ui.yaml
-	@echo "Done"
+	@echo "Installing crd-ref-docs" && GO111MODULE=on go install -v github.com/elastic/crd-ref-docs@latest
+	@${GOPATH}/bin/crd-ref-docs --source-path=./pkg/apis/minio.min.io/v2  --config=docs/templates/config.yaml --renderer=asciidoctor --output-path=docs/tenant_crd.adoc --templates-dir=docs/templates/asciidoctor/
+	@${GOPATH}/bin/crd-ref-docs --source-path=./pkg/apis/sts.min.io/v1beta1  --config=docs/templates/config.yaml --renderer=asciidoctor --output-path=docs/policybinding_crd.adoc --templates-dir=docs/templates/asciidoctor/
 
 generate-code:
 	@./k8s/update-codegen.sh
 
-generate-openshift-manifests:
-	@./olm.sh
-
-release: generate-openshift-manifests
-	@./release.sh
+helm-reindex:
+	@echo "Re-indexing helm chart release"
 	@./helm-reindex.sh
+
+update-versions:
+	@./release.sh --release-sidecar=$(RELEASE_SIDECAR)
+
+release: update-versions generate-code regen-crd regen-crd-docs
+	@git add .
+
+apply-gofmt:
+	@echo "Applying gofmt to all generated an existing files"
+	@GO111MODULE=on gofmt -w .
+

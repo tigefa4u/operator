@@ -15,10 +15,36 @@
 package statefulsets
 
 import (
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+
+	"golang.org/x/mod/semver"
+
+	"github.com/minio/operator/pkg/certs"
+
 	miniov2 "github.com/minio/operator/pkg/apis/minio.min.io/v2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	gcpCredentialVolumeMountName = "gcp-ksa"
+	gcpCredentialVolumeMountPath = "/var/run/secrets/tokens/gcp-ksa"
+	serviceAccountTokenPath      = "token"
+	gcpAppCredentialsPath        = "google-application-credentials.json"
+)
+
+var (
+	defaultServiceAccountTokenExpiryInSecs int64 = 172800 // 48 hrs
+	// gcpCredentialVolumeMount represents the volume mount for GCP creds and service token
+	gcpCredentialVolumeMount = corev1.VolumeMount{
+		Name:      gcpCredentialVolumeMountName,
+		ReadOnly:  true,
+		MountPath: gcpCredentialVolumeMountPath,
+	}
 )
 
 // KESMetadata Returns the KES pods metadata set in configuration.
@@ -46,30 +72,44 @@ func KESSelector(t *miniov2.Tenant) *metav1.LabelSelector {
 }
 
 // KESVolumeMounts builds the volume mounts for MinIO container.
-func KESVolumeMounts(t *miniov2.Tenant) []corev1.VolumeMount {
-	return []corev1.VolumeMount{
+func KESVolumeMounts(t *miniov2.Tenant) (volumeMounts []corev1.VolumeMount) {
+	volumeMounts = []corev1.VolumeMount{
 		{
 			Name:      t.KESVolMountName(),
 			MountPath: miniov2.KESConfigMountPath,
 		},
 	}
+	if t.HasGCPCredentialSecretForKES() {
+		volumeMounts = append(volumeMounts, gcpCredentialVolumeMount)
+	}
+	return
 }
 
 // KESEnvironmentVars returns the KES environment variables set in configuration.
 func KESEnvironmentVars(t *miniov2.Tenant) []corev1.EnvVar {
-	// pass the identity created while generating the MinIO client cert
-	return []corev1.EnvVar{
-		{
-			Name:  "MINIO_KES_IDENTITY",
-			Value: miniov2.KESIdentity,
-		},
-	}
+	var envVars []corev1.EnvVar
+	// Add all the tenant.spec.kes.env environment variables
+	// User defined environment variables will take precedence over default environment variables
+	envVars = append(envVars, t.GetKESEnvVars()...)
+	// sort the array to produce the same result everytime
+	sort.Slice(envVars, func(i, j int) bool {
+		return envVars[i].Name < envVars[j].Name
+	})
+	return envVars
 }
 
 // KESServerContainer returns the KES container for a KES StatefulSet.
 func KESServerContainer(t *miniov2.Tenant) corev1.Container {
 	// Args to start KES with config mounted at miniov2.KESConfigMountPath and require but don't verify mTLS authentication
-	args := []string{"server", "--config=" + miniov2.KESConfigMountPath + "/server-config.yaml", "--auth=off"}
+	args := []string{"server", "--config=" + miniov2.KESConfigMountPath + "/server-config.yaml"}
+
+	kesVersion, _ := getKesConfigVersion(t.Spec.KES.Image)
+	// Add `--auth` flag only on config versions that are still compatible with it (v1 and v2).
+	// Starting KES 2023-11-09T17-35-47Z (v3) is no longer supported.
+	switch kesVersion {
+	case KesConfigVersion1, KesConfigVersion2:
+		args = append(args, "--auth=off")
+	}
 
 	return corev1.Container{
 		Name:  miniov2.KESContainerName,
@@ -84,6 +124,7 @@ func KESServerContainer(t *miniov2.Tenant) corev1.Container {
 		Args:            args,
 		Env:             KESEnvironmentVars(t),
 		Resources:       t.Spec.KES.Resources,
+		SecurityContext: kesContainerSecurityContext(t),
 	}
 }
 
@@ -93,16 +134,62 @@ func kesSecurityContext(t *miniov2.Tenant) *corev1.PodSecurityContext {
 	var runAsUser int64 = 1000
 	var runAsGroup int64 = 1000
 	var fsGroup int64 = 1000
+	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
+
 	securityContext := corev1.PodSecurityContext{
-		RunAsNonRoot: &runAsNonRoot,
-		RunAsUser:    &runAsUser,
-		RunAsGroup:   &runAsGroup,
-		FSGroup:      &fsGroup,
+		RunAsNonRoot:        &runAsNonRoot,
+		RunAsUser:           &runAsUser,
+		RunAsGroup:          &runAsGroup,
+		FSGroup:             &fsGroup,
+		FSGroupChangePolicy: &fsGroupChangePolicy,
 	}
 	if t.HasKESEnabled() && t.Spec.KES.SecurityContext != nil {
 		securityContext = *t.Spec.KES.SecurityContext
 	}
 	return &securityContext
+}
+
+// Builds the security context for kes containers
+func kesContainerSecurityContext(t *miniov2.Tenant) *corev1.SecurityContext {
+	// Default values:
+	// By default, values should be totally empty if not provided
+	// This is specially needed in OpenShift where Security Context Constraints restrict them
+	// if let empty then OCP can pick the values from the constraints defined.
+	containerSecurityContext := corev1.SecurityContext{}
+	runAsNonRoot := true
+	var runAsUser int64 = 1000
+	var runAsGroup int64 = 1000
+	poolSCSet := false
+
+	// Values from pool.SecurityContext ONLY if provided
+	if t.Spec.KES != nil && t.Spec.KES.SecurityContext != nil {
+		if t.Spec.KES.SecurityContext.RunAsNonRoot != nil {
+			runAsNonRoot = *t.Spec.KES.SecurityContext.RunAsNonRoot
+			poolSCSet = true
+		}
+		if t.Spec.KES.SecurityContext.RunAsUser != nil {
+			runAsUser = *t.Spec.KES.SecurityContext.RunAsUser
+			poolSCSet = true
+		}
+		if t.Spec.KES.SecurityContext.RunAsGroup != nil {
+			runAsGroup = *t.Spec.KES.SecurityContext.RunAsGroup
+			poolSCSet = true
+		}
+		if poolSCSet {
+			// Only set values if one of above is set otherwise let it empty
+			containerSecurityContext = corev1.SecurityContext{
+				RunAsNonRoot: &runAsNonRoot,
+				RunAsUser:    &runAsUser,
+				RunAsGroup:   &runAsGroup,
+			}
+		}
+	}
+
+	// Values from kes.ContainerSecurityContext if provided
+	if t.Spec.KES != nil && t.Spec.KES.ContainerSecurityContext != nil {
+		containerSecurityContext = *t.Spec.KES.ContainerSecurityContext
+	}
+	return &containerSecurityContext
 }
 
 // NewForKES creates a new KES StatefulSet for the given Cluster.
@@ -120,8 +207,8 @@ func NewForKES(t *miniov2.Tenant, serviceName string) *appsv1.StatefulSet {
 	var clientCertSecret string
 
 	serverCertPaths := []corev1.KeyToPath{
-		{Key: "public.crt", Path: certPath},
-		{Key: "private.key", Path: keyPath},
+		{Key: certs.PublicCertFile, Path: certPath},
+		{Key: certs.PrivateKeyFile, Path: keyPath},
 	}
 
 	configPath := []corev1.KeyToPath{
@@ -135,8 +222,8 @@ func NewForKES(t *miniov2.Tenant, serviceName string) *appsv1.StatefulSet {
 		// "cert-manager.io/v1alpha2" because of same keys in both.
 		if t.Spec.KES.ExternalCertSecret.Type == "kubernetes.io/tls" || t.Spec.KES.ExternalCertSecret.Type == "cert-manager.io/v1alpha2" || t.Spec.KES.ExternalCertSecret.Type == "cert-manager.io/v1" {
 			serverCertPaths = []corev1.KeyToPath{
-				{Key: "tls.crt", Path: certPath},
-				{Key: "tls.key", Path: keyPath},
+				{Key: certs.TLSCertFile, Path: certPath},
+				{Key: certs.TLSKeyFile, Path: keyPath},
 			}
 		}
 	} else {
@@ -190,6 +277,39 @@ func NewForKES(t *miniov2.Tenant, serviceName string) *appsv1.StatefulSet {
 		},
 	}
 
+	if t.HasGCPCredentialSecretForKES() {
+		var gcpVolumeDefaultMode int32 = 420
+		var isOptional bool
+		podVolumes = append(podVolumes, corev1.Volume{
+			Name: gcpCredentialVolumeMountName,
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{
+					DefaultMode: &gcpVolumeDefaultMode,
+					Sources: []corev1.VolumeProjection{
+						{
+							Secret: &corev1.SecretProjection{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: t.Spec.KES.GCPCredentialSecretName,
+								},
+								Items: []corev1.KeyToPath{
+									{Key: "config", Path: gcpAppCredentialsPath},
+								},
+								Optional: &isOptional,
+							},
+						},
+						{
+							ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+								Audience:          t.Spec.KES.GCPWorkloadIdentityPool,
+								ExpirationSeconds: &defaultServiceAccountTokenExpiryInSecs,
+								Path:              serviceAccountTokenPath,
+							},
+						},
+					},
+				},
+			},
+		})
+	}
+
 	containers := []corev1.Container{KESServerContainer(t)}
 
 	ss := &appsv1.StatefulSet{
@@ -230,4 +350,70 @@ func NewForKES(t *miniov2.Tenant, serviceName string) *appsv1.StatefulSet {
 	}
 
 	return ss
+}
+
+const (
+	// imageTagWithArchRegex is a regular expression to identify if a KES tag
+	// includes the arch as suffix, ie: 2023-05-02T22-48-10Z-arm64
+	kesImageTagWithArchRegexPattern = `(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)(-.*)`
+)
+
+const (
+	// KesConfigVersion1 identifier v1
+	KesConfigVersion1 = "v1"
+	// KesConfigVersion2 identifier v2
+	KesConfigVersion2 = "v2"
+)
+
+func getKesConfigVersion(image string) (string, error) {
+	version := KesConfigVersion2
+
+	imageStrings := strings.Split(image, ":")
+	var imageTag string
+	if len(imageStrings) > 1 {
+		imageTag = imageStrings[1]
+	} else {
+		return "", fmt.Errorf("%s not a valid KES release tag", image)
+	}
+
+	if imageTag == "edge" {
+		return KesConfigVersion2, nil
+	}
+
+	if imageTag == "latest" {
+		return KesConfigVersion2, nil
+	}
+
+	// When the image tag is semantic version is config v1
+	if semver.IsValid(imageTag) {
+		// Admin is required starting version v0.22.0
+		if semver.Compare(imageTag, "v0.22.0") < 0 {
+			return KesConfigVersion1, nil
+		}
+		return KesConfigVersion2, nil
+	}
+
+	releaseTagNoArch := imageTag
+
+	re := regexp.MustCompile(kesImageTagWithArchRegexPattern)
+	// if pattern matches, that means we have a tag with arch
+	if matched := re.Match([]byte(imageTag)); matched {
+		slicesOfTag := re.FindStringSubmatch(imageTag)
+		// here we will remove the arch suffix by assigning the first group in the regex
+		releaseTagNoArch = slicesOfTag[1]
+	}
+
+	// v0.22.0 is the initial image version for Kes config v2, any time format came after and is v2
+	_, err := miniov2.ReleaseTagToReleaseTime(releaseTagNoArch)
+	if err != nil {
+		// could not parse semversion either, returning error
+		return "", fmt.Errorf("could not identify KES version from image TAG: %s", releaseTagNoArch)
+	}
+
+	// Leaving this snippet as comment as this will helpful to compare in future config versions
+	// kesv2ReleaseTime, _ := miniov2.ReleaseTagToReleaseTime("2023-04-03T16-41-28Z")
+	// if imageVersionTime.Before(kesv2ReleaseTime) {
+	// 	version = kesConfigVersion2
+	// }
+	return version, nil
 }

@@ -16,225 +16,69 @@ package statefulsets
 
 import (
 	"fmt"
+	"path/filepath"
+	"sort"
 	"strconv"
-	"strings"
+
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	miniov2 "github.com/minio/operator/pkg/apis/minio.min.io/v2"
+	"github.com/minio/operator/pkg/certs"
+	"github.com/minio/operator/pkg/utils"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Adds required Console environment variables
-func consoleEnvVars(t *miniov2.Tenant) []corev1.EnvVar {
-	envVars := []corev1.EnvVar{
-		{
-			Name:  "MINIO_SERVER_URL",
-			Value: t.MinIOServerEndpoint(),
-		},
-	}
-	if t.HasLogEnabled() {
-		envVars = append(envVars, corev1.EnvVar{
-			Name: miniov2.LogQueryTokenKey,
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: t.LogSecretName(),
-					},
-					Key: miniov2.LogQueryTokenKey,
-				},
-			},
-		})
-		url := fmt.Sprintf("http://%s:%d", t.LogSearchAPIServiceName(), miniov2.LogSearchAPIPort)
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "MINIO_LOG_QUERY_URL",
-			Value: url,
-		})
-	}
-	if t.HasPrometheusEnabled() {
-		url := fmt.Sprintf("http://%s:%d", t.PrometheusHLServiceName(), miniov2.PrometheusAPIPort)
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  miniov2.ConsolePrometheusURL,
-			Value: url,
-		})
-	}
-
-	return envVars
-}
-
 // Returns the MinIO environment variables set in configuration.
 // If a user specifies a secret in the spec (for MinIO credentials) we use
 // that to set MINIO_ROOT_USER & MINIO_ROOT_PASSWORD.
-func minioEnvironmentVars(t *miniov2.Tenant, wsSecret *v1.Secret, hostsTemplate string, opVersion string) []corev1.EnvVar {
+func minioEnvironmentVars(t *miniov2.Tenant, skipEnvVars map[string][]byte) []corev1.EnvVar {
 	var envVars []corev1.EnvVar
-	// Add all the environment variables
-	envVars = append(envVars, t.GetEnvVars()...)
 
-	// Enable `mc admin update` style updates to MinIO binaries
-	// within the container, only operator is supposed to perform
-	// these operations.
-	envVars = append(envVars,
-		corev1.EnvVar{
-			Name:  "MINIO_UPDATE",
-			Value: "on",
-		}, corev1.EnvVar{
-			Name:  "MINIO_UPDATE_MINISIGN_PUBKEY",
-			Value: "RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav",
-		}, corev1.EnvVar{
-			Name: miniov2.WebhookMinIOArgs,
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: miniov2.WebhookSecret,
-					},
-					Key: miniov2.WebhookMinIOArgs,
-				},
-			},
-		}, corev1.EnvVar{
-			// Add a fallback in-case operator is down.
-			Name:  "MINIO_ENDPOINTS",
-			Value: strings.Join(GetContainerArgs(t, hostsTemplate), " "),
-		}, corev1.EnvVar{
-			Name:  "MINIO_OPERATOR_VERSION",
-			Value: opVersion,
-		}, corev1.EnvVar{
-			Name:  "MINIO_PROMETHEUS_JOB_ID",
-			Value: t.PrometheusConfigJobName(),
-		})
+	envVarsMap := map[string]corev1.EnvVar{}
 
-	var domains []string
-	// Enable Bucket DNS only if asked for by default turned off
-	if t.BucketDNS() {
-		domains = append(domains, t.MinIOBucketBaseDomain())
-		envVars = append(envVars, corev1.EnvVar{
-			Name: miniov2.WebhookMinIOBucket,
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: miniov2.WebhookSecret,
-					},
-					Key: miniov2.WebhookMinIOArgs,
-				},
-			},
-		})
-	}
-	// Check if any domains are configured
-	if t.HasMinIODomains() {
-		domains = append(domains, t.Spec.Features.Domains.Minio...)
-	}
-	// tell MinIO about all the domains meant to hit it
-	if len(domains) > 0 {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "MINIO_DOMAIN",
-			Value: strings.Join(domains, ","),
-		})
+	envVarsMap["MINIO_CONFIG_ENV_FILE"] = corev1.EnvVar{
+		Name:  "MINIO_CONFIG_ENV_FILE",
+		Value: miniov2.CfgFile,
 	}
 
-	// Add env variables from credentials secret, if no secret provided, dont use
-	// env vars. MinIO server automatically creates default credentials
-	if !t.HasConfigurationSecret() && t.HasCredsSecret() {
-		secretName := t.Spec.CredsSecret.Name
-		envVars = append(envVars, corev1.EnvVar{
-			Name: "MINIO_ROOT_USER",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: secretName,
-					},
-					Key: "accesskey",
-				},
-			},
-		}, corev1.EnvVar{
-			Name: "MINIO_ROOT_PASSWORD",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: secretName,
-					},
-					Key: "secretkey",
-				},
-			},
-		})
+	// transform map to array and skip configurations from config.env
+	for _, env := range envVarsMap {
+		if _, ok := skipEnvVars[env.Name]; !ok {
+			envVars = append(envVars, env)
+		}
 	}
-
-	if t.HasKESEnabled() {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "MINIO_KMS_KES_ENDPOINT",
-			Value: t.KESServiceEndpoint(),
-		}, corev1.EnvVar{
-			Name:  "MINIO_KMS_KES_CERT_FILE",
-			Value: miniov2.MinIOCertPath + "/client.crt",
-		}, corev1.EnvVar{
-			Name:  "MINIO_KMS_KES_KEY_FILE",
-			Value: miniov2.MinIOCertPath + "/client.key",
-		}, corev1.EnvVar{
-			Name:  "MINIO_KMS_KES_CA_PATH",
-			Value: miniov2.MinIOCertPath + "/CAs/kes.crt",
-		}, corev1.EnvVar{
-			Name:  "MINIO_KMS_KES_KEY_NAME",
-			Value: t.Spec.KES.KeyName,
-		})
-	}
-
-	if t.HasConfigurationSecret() {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "MINIO_CONFIG_ENV_FILE",
-			Value: miniov2.TmpPath + "/minio-config/config.env",
-		})
-	}
-
+	// sort the array to produce the same result everytime
+	sort.Slice(envVars, func(i, j int) bool {
+		return envVars[i].Name < envVars[j].Name
+	})
 	// Return environment variables
 	return envVars
 }
 
 // PodMetadata Returns the MinIO pods metadata set in configuration.
 // If a user specifies metadata in the spec we return that metadata.
-func PodMetadata(t *miniov2.Tenant, pool *miniov2.Pool, opVersion string) metav1.ObjectMeta {
+func PodMetadata(t *miniov2.Tenant, pool *miniov2.Pool) metav1.ObjectMeta {
 	meta := metav1.ObjectMeta{}
-	// Copy Labels and Annotations from Tenant
-	labels := t.ObjectMeta.Labels
-	annotations := t.ObjectMeta.Annotations
-
-	if annotations == nil {
-		annotations = make(map[string]string)
+	if t.Spec.PoolsMetadata != nil {
+		meta.Labels = t.Spec.PoolsMetadata.Labels
+		meta.Annotations = t.Spec.PoolsMetadata.Annotations
 	}
+	meta.Labels = utils.MergeMaps(meta.Labels, pool.Labels, t.MinIOPodLabels(), t.ConsolePodLabels())
+	meta.Annotations = utils.MergeMaps(meta.Annotations, pool.Annotations)
 
-	annotations[miniov2.Revision] = fmt.Sprintf("%d", t.Status.Revision)
-
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	// Add the additional label used by StatefulSet spec selector
-	for k, v := range t.MinIOPodLabels() {
-		labels[k] = v
-	}
-	// Add information labels, such as which pool we are building this pod about
-	labels[miniov2.PoolLabel] = pool.Name
-	// Add the additional label used by Console spec selector
-	for k, v := range t.ConsolePodLabels() {
-		labels[k] = v
-	}
-
-	// Add user specific annotations
-	if pool.Annotations != nil {
-		annotations = miniov2.MergeMaps(annotations, pool.Annotations)
-	}
-
-	if pool.Labels != nil {
-		labels = miniov2.MergeMaps(labels, pool.Labels)
-	}
-
-	meta.Labels = labels
-	meta.Annotations = annotations
+	// Set specific information
+	meta.Labels[miniov2.PoolLabel] = pool.Name
+	meta.Annotations[miniov2.Revision] = fmt.Sprintf("%d", t.Status.Revision)
 
 	return meta
 }
 
 // ContainerMatchLabels Returns the labels that match the Pods in the statefulset
 func ContainerMatchLabels(t *miniov2.Tenant, pool *miniov2.Pool) *metav1.LabelSelector {
-	labels := miniov2.MergeMaps(t.MinIOPodLabels(), t.ConsolePodLabels())
+	labels := utils.MergeMaps(t.MinIOPodLabels(), t.ConsolePodLabels())
 	// Add pool information so it's passed down to the underlying PVCs
 	labels[miniov2.PoolLabel] = pool.Name
 	return &metav1.LabelSelector{
@@ -242,14 +86,28 @@ func ContainerMatchLabels(t *miniov2.Tenant, pool *miniov2.Pool) *metav1.LabelSe
 	}
 }
 
+// CfgVolumeMount is the volume mount used by `minio`, `sidecar` and `validate-arguments` containers
+var CfgVolumeMount = corev1.VolumeMount{
+	Name:      CfgVol,
+	MountPath: miniov2.CfgPath,
+}
+
+// TmpCfgVolumeMount is the temporary location
+var TmpCfgVolumeMount = corev1.VolumeMount{
+	Name:      "configuration",
+	MountPath: miniov2.TmpPath + "/minio-config",
+}
+
 // Builds the volume mounts for MinIO container.
-func volumeMounts(t *miniov2.Tenant, pool *miniov2.Pool, operatorTLS bool, certVolumeSources []v1.VolumeProjection) (mounts []v1.VolumeMount) {
-	// This is the case where user didn't provide a pool and we deploy a EmptyDir based
-	// single node single drive (FS) MinIO deployment
+func volumeMounts(t *miniov2.Tenant, pool *miniov2.Pool, certVolumeSources []corev1.VolumeProjection) (mounts []corev1.VolumeMount) {
+	// Default volume name, unless another one was provided
 	name := miniov2.MinIOVolumeName
 	if pool.VolumeClaimTemplate != nil {
 		name = pool.VolumeClaimTemplate.Name
 	}
+
+	// shared configuration Volume
+	mounts = append(mounts, CfgVolumeMount)
 
 	if pool.VolumesPerServer == 1 {
 		mounts = append(mounts, corev1.VolumeMount{
@@ -265,19 +123,12 @@ func volumeMounts(t *miniov2.Tenant, pool *miniov2.Pool, operatorTLS bool, certV
 		}
 	}
 
-	// CertPath (/tmp/certs) will always be mounted even if the tenant doesnt have any TLS certificate
+	// CertPath (/tmp/certs) will always be mounted even if the tenant doesn't have any TLS certificate
 	// operator will still mount the operator public cert under /tmp/certs/CAs/operator.crt
-	if operatorTLS || len(certVolumeSources) > 0 {
+	if len(certVolumeSources) > 0 {
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      t.MinIOTLSSecretName(),
 			MountPath: miniov2.MinIOCertPath,
-		})
-	}
-
-	if t.HasConfigurationSecret() {
-		mounts = append(mounts, corev1.VolumeMount{
-			Name:      "configuration",
-			MountPath: miniov2.TmpPath + "/minio-config",
 		})
 	}
 
@@ -285,12 +136,40 @@ func volumeMounts(t *miniov2.Tenant, pool *miniov2.Pool, operatorTLS bool, certV
 }
 
 // Builds the MinIO container for a Tenant.
-func poolMinioServerContainer(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, hostsTemplate string, opVersion string, operatorTLS bool, certVolumeSources []v1.VolumeProjection) v1.Container {
+func poolMinioServerContainer(t *miniov2.Tenant, skipEnvVars map[string][]byte, pool *miniov2.Pool, certVolumeSources []corev1.VolumeProjection) corev1.Container {
 	consolePort := miniov2.ConsolePort
 	if t.TLS() {
 		consolePort = miniov2.ConsoleTLSPort
 	}
-	args := []string{"server", "--certs-dir", miniov2.MinIOCertPath, "--console-address", ":" + strconv.Itoa(consolePort)}
+	args := []string{
+		"server",
+		"--certs-dir", miniov2.MinIOCertPath,
+		"--console-address", ":" + strconv.Itoa(consolePort),
+	}
+
+	containerPorts := []corev1.ContainerPort{
+		{
+			Name:          miniov2.MinIOPortName,
+			ContainerPort: miniov2.MinIOPort,
+		},
+		{
+			Name:          miniov2.ConsolePortName,
+			ContainerPort: int32(consolePort),
+		},
+	}
+
+	if t.Spec.Features != nil && t.Spec.Features.EnableSFTP != nil && *t.Spec.Features.EnableSFTP {
+		pkFile := filepath.Join(miniov2.MinIOCertPath, certs.PrivateKeyFile)
+		args = append(args, []string{
+			"--sftp", fmt.Sprintf("address=:%d", miniov2.MinIOSFTPPort),
+			"--sftp", "ssh-private-key=" + pkFile,
+		}...)
+		containerPorts = append(containerPorts, corev1.ContainerPort{
+			Name:          miniov2.MinIOSFTPPortName,
+			ContainerPort: miniov2.MinIOSFTPPort,
+		})
+	}
+
 	if t.Spec.Logging != nil {
 		// If logging is specified, expect users to
 		// provide the right set of settings to toggle
@@ -307,23 +186,19 @@ func poolMinioServerContainer(t *miniov2.Tenant, wsSecret *v1.Secret, pool *mini
 	}
 
 	return corev1.Container{
-		Name:  miniov2.MinIOServerName,
-		Image: t.Spec.Image,
-		Ports: []corev1.ContainerPort{
-			{
-				ContainerPort: miniov2.MinIOPort,
-			},
-			{
-				ContainerPort: int32(consolePort),
-			},
-		},
+		Name:            miniov2.MinIOServerName,
+		Image:           t.Spec.Image,
+		Ports:           containerPorts,
 		ImagePullPolicy: t.Spec.ImagePullPolicy,
-		VolumeMounts:    volumeMounts(t, pool, operatorTLS, certVolumeSources),
+		VolumeMounts:    volumeMounts(t, pool, certVolumeSources),
 		Args:            args,
-		Env:             append(minioEnvironmentVars(t, wsSecret, hostsTemplate, opVersion), consoleEnvVars(t)...),
+		Env:             minioEnvironmentVars(t, skipEnvVars),
 		Resources:       pool.Resources,
 		LivenessProbe:   t.Spec.Liveness,
 		ReadinessProbe:  t.Spec.Readiness,
+		StartupProbe:    t.Spec.Startup,
+		Lifecycle:       t.Spec.Lifecycle,
+		SecurityContext: poolContainerSecurityContext(pool),
 	}
 }
 
@@ -354,16 +229,19 @@ func poolTopologySpreadConstraints(z *miniov2.Pool) []corev1.TopologySpreadConst
 }
 
 // Builds the security context for a Pool
-func poolSecurityContext(pool *miniov2.Pool, status *miniov2.PoolStatus) *v1.PodSecurityContext {
+func poolSecurityContext(pool *miniov2.Pool, status *miniov2.PoolStatus) *corev1.PodSecurityContext {
 	runAsNonRoot := true
 	var runAsUser int64 = 1000
 	var runAsGroup int64 = 1000
 	var fsGroup int64 = 1000
+	fsGroupChangePolicy := corev1.FSGroupChangeOnRootMismatch
+
 	securityContext := corev1.PodSecurityContext{
-		RunAsNonRoot: &runAsNonRoot,
-		RunAsUser:    &runAsUser,
-		RunAsGroup:   &runAsGroup,
-		FSGroup:      &fsGroup,
+		RunAsNonRoot:        &runAsNonRoot,
+		RunAsUser:           &runAsUser,
+		RunAsGroup:          &runAsGroup,
+		FSGroup:             &fsGroup,
+		FSGroupChangePolicy: &fsGroupChangePolicy,
 	}
 
 	if pool != nil && pool.SecurityContext != nil {
@@ -380,21 +258,85 @@ func poolSecurityContext(pool *miniov2.Pool, status *miniov2.PoolStatus) *v1.Pod
 	return &securityContext
 }
 
+// Builds the security context for containers in a Pool
+func poolContainerSecurityContext(pool *miniov2.Pool) *corev1.SecurityContext {
+	// By default, we are opinionated and set the following values to request
+	// kubernetes to run our pods as a non-root user intentionally, we don't need to be root
+	// if the user needs a special security context, it should be specified on the pool's
+	// securityContext
+	runAsNonRoot := true
+	var runAsUser int64 = 1000
+	var runAsGroup int64 = 1000
+	if pool != nil && pool.SecurityContext != nil {
+		if pool.SecurityContext.RunAsNonRoot != nil {
+			runAsNonRoot = *pool.SecurityContext.RunAsNonRoot
+		}
+		if pool.SecurityContext.RunAsUser != nil {
+			runAsUser = *pool.SecurityContext.RunAsUser
+		}
+		if pool.SecurityContext.RunAsGroup != nil {
+			runAsGroup = *pool.SecurityContext.RunAsGroup
+		}
+	}
+
+	containerSecurityContext := corev1.SecurityContext{
+		RunAsNonRoot: &runAsNonRoot,
+		RunAsUser:    &runAsUser,
+		RunAsGroup:   &runAsGroup,
+	}
+
+	// Values from pool.ContainerSecurityContext if provided
+	if pool.ContainerSecurityContext != nil {
+		containerSecurityContext = *pool.ContainerSecurityContext
+	}
+
+	return &containerSecurityContext
+}
+
+// CfgVol is the name of the configuration volume we will use
+const CfgVol = "cfg-vol"
+
+// NewPoolArgs arguments used to create a new pool
+type NewPoolArgs struct {
+	Tenant          *miniov2.Tenant
+	SkipEnvVars     map[string][]byte
+	Pool            *miniov2.Pool
+	PoolStatus      *miniov2.PoolStatus
+	ServiceName     string
+	HostsTemplate   string
+	OperatorVersion string
+}
+
 // NewPool creates a new StatefulSet for the given Cluster.
-func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolStatus *miniov2.PoolStatus, serviceName, hostsTemplate, operatorVersion string, operatorTLS bool) *appsv1.StatefulSet {
+func NewPool(args *NewPoolArgs) *appsv1.StatefulSet {
+	t := args.Tenant.DeepCopy()
+	skipEnvVars := args.SkipEnvVars
+	pool := args.Pool
+	poolStatus := args.PoolStatus
+	serviceName := args.ServiceName
+
 	var podVolumes []corev1.Volume
 	replicas := pool.Servers
 	var certVolumeSources []corev1.VolumeProjection
 
 	var clientCertSecret string
 	clientCertPaths := []corev1.KeyToPath{
-		{Key: "public.crt", Path: "client.crt"},
-		{Key: "private.key", Path: "client.key"},
+		{Key: certs.PublicCertFile, Path: "client.crt"},
+		{Key: certs.PrivateKeyFile, Path: "client.key"},
 	}
 	var kesCertSecret string
 	KESCertPath := []corev1.KeyToPath{
-		{Key: "public.crt", Path: "CAs/kes.crt"},
+		{Key: certs.PublicCertFile, Path: "CAs/kes.crt"},
 	}
+
+	// Create an empty dir volume to share the configuration between the main container and side-car
+
+	podVolumes = append(podVolumes, corev1.Volume{
+		Name: CfgVol,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
 
 	// Multiple certificates will be mounted using the following folder structure:
 	//
@@ -419,8 +361,8 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 	//
 	// Iterate over all provided TLS certificates and store them on the list of Volumes that will be mounted to the Pod
 	for index, secret := range t.Spec.ExternalCertSecret {
-		crtMountPath := fmt.Sprintf("hostname-%d/public.crt", index)
-		keyMountPath := fmt.Sprintf("hostname-%d/private.key", index)
+		crtMountPath := fmt.Sprintf("hostname-%d/%s", index, certs.PublicCertFile)
+		keyMountPath := fmt.Sprintf("hostname-%d/%s", index, certs.PrivateKeyFile)
 		caMountPath := fmt.Sprintf("CAs/hostname-%d.crt", index)
 		// MinIO requires to have at least 1 certificate keyPair under the `certs` folder, by default
 		// we will take the first secret as the default certificate
@@ -429,29 +371,29 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 		//		+ public.crt
 		//		+ private.key
 		if index == 0 {
-			crtMountPath = "public.crt"
-			keyMountPath = "private.key"
-			caMountPath = "CAs/public.crt"
+			crtMountPath = certs.PublicCertFile
+			keyMountPath = certs.PrivateKeyFile
+			caMountPath = fmt.Sprintf("%s/%s", certs.CertsCADir, certs.PublicCertFile)
 		}
 
 		var serverCertPaths []corev1.KeyToPath
 		if secret.Type == "kubernetes.io/tls" {
 			serverCertPaths = []corev1.KeyToPath{
-				{Key: "tls.crt", Path: crtMountPath},
-				{Key: "tls.key", Path: keyMountPath},
-				{Key: "tls.crt", Path: caMountPath},
+				{Key: certs.TLSCertFile, Path: crtMountPath},
+				{Key: certs.TLSKeyFile, Path: keyMountPath},
+				{Key: certs.TLSCertFile, Path: caMountPath},
 			}
 		} else if secret.Type == "cert-manager.io/v1alpha2" || secret.Type == "cert-manager.io/v1" {
 			serverCertPaths = []corev1.KeyToPath{
-				{Key: "tls.crt", Path: crtMountPath},
-				{Key: "tls.key", Path: keyMountPath},
-				{Key: "ca.crt", Path: caMountPath},
+				{Key: certs.TLSCertFile, Path: crtMountPath},
+				{Key: certs.TLSKeyFile, Path: keyMountPath},
+				{Key: certs.CAPublicCertFile, Path: caMountPath},
 			}
 		} else {
 			serverCertPaths = []corev1.KeyToPath{
-				{Key: "public.crt", Path: crtMountPath},
-				{Key: "private.key", Path: keyMountPath},
-				{Key: "public.crt", Path: caMountPath},
+				{Key: certs.PublicCertFile, Path: crtMountPath},
+				{Key: certs.PrivateKeyFile, Path: keyMountPath},
+				{Key: certs.PublicCertFile, Path: caMountPath},
 			}
 		}
 		certVolumeSources = append(certVolumeSources, corev1.VolumeProjection{
@@ -465,13 +407,13 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 	}
 	// AutoCert certificates will be used for internal communication if requested
 	if t.AutoCert() {
-		crtMountPath := "public.crt"
-		keyMountPath := "private.key"
-		caMountPath := "CAs/public.crt"
+		crtMountPath := certs.PublicCertFile
+		keyMountPath := certs.PrivateKeyFile
+		caMountPath := fmt.Sprintf("%s/%s", certs.CertsCADir, certs.PublicCertFile)
 		if len(t.Spec.ExternalCertSecret) > 0 {
 			index := len(t.Spec.ExternalCertSecret)
-			crtMountPath = fmt.Sprintf("hostname-%d/public.crt", index)
-			keyMountPath = fmt.Sprintf("hostname-%d/private.key", index)
+			crtMountPath = fmt.Sprintf("hostname-%d/%s", index, certs.PublicCertFile)
+			keyMountPath = fmt.Sprintf("hostname-%d/%s", index, certs.PrivateKeyFile)
 			caMountPath = fmt.Sprintf("CAs/hostname-%d.crt", index)
 		}
 		certVolumeSources = append(certVolumeSources, corev1.VolumeProjection{
@@ -480,10 +422,55 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 					Name: t.MinIOTLSSecretName(),
 				},
 				Items: []corev1.KeyToPath{
-					{Key: "public.crt", Path: crtMountPath},
-					{Key: "private.key", Path: keyMountPath},
-					{Key: "public.crt", Path: caMountPath},
+					{Key: certs.PublicCertFile, Path: crtMountPath},
+					{Key: certs.PrivateKeyFile, Path: keyMountPath},
+					{Key: certs.PublicCertFile, Path: caMountPath},
 				},
+			},
+		})
+	}
+	// Multiple client certificates will be mounted using the following folder structure:
+	//
+	//	certs
+	//		|
+	//		+ client-0
+	//		|			+ client.crt
+	//		|			+ client.key
+	//		+ client-1
+	//		|			+ client.crt
+	//		|			+ client.key
+	//		+ client-2
+	//		|			+ client.crt
+	//		|			+ client.key
+	//
+	// Iterate over all provided client TLS certificates and store them on the list of Volumes that will be mounted to the Pod
+	for index, secret := range t.Spec.ExternalClientCertSecrets {
+		crtMountPath := fmt.Sprintf("client-%d/client.crt", index)
+		keyMountPath := fmt.Sprintf("client-%d/client.key", index)
+		var clientKeyPairPaths []corev1.KeyToPath
+		if secret.Type == "kubernetes.io/tls" {
+			clientKeyPairPaths = []corev1.KeyToPath{
+				{Key: certs.TLSCertFile, Path: crtMountPath},
+				{Key: certs.TLSKeyFile, Path: keyMountPath},
+			}
+		} else if secret.Type == "cert-manager.io/v1alpha2" || secret.Type == "cert-manager.io/v1" {
+			clientKeyPairPaths = []corev1.KeyToPath{
+				{Key: certs.TLSCertFile, Path: crtMountPath},
+				{Key: certs.TLSKeyFile, Path: keyMountPath},
+				{Key: certs.CAPublicCertFile, Path: fmt.Sprintf("%s/client-ca-%d.crt", certs.CertsCADir, index)},
+			}
+		} else {
+			clientKeyPairPaths = []corev1.KeyToPath{
+				{Key: certs.PublicCertFile, Path: crtMountPath},
+				{Key: certs.PrivateKeyFile, Path: keyMountPath},
+			}
+		}
+		certVolumeSources = append(certVolumeSources, corev1.VolumeProjection{
+			Secret: &corev1.SecretProjection{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: secret.Name,
+				},
+				Items: clientKeyPairPaths,
 			},
 		})
 	}
@@ -501,15 +488,15 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 		// "cert-manager.io/v1alpha2" because of same keys in both.
 		if secret.Type == "kubernetes.io/tls" {
 			caCertPaths = []corev1.KeyToPath{
-				{Key: "tls.crt", Path: fmt.Sprintf("CAs/ca-%d.crt", index)},
+				{Key: certs.TLSCertFile, Path: fmt.Sprintf("%s/ca-%d.crt", certs.CertsCADir, index)},
 			}
 		} else if secret.Type == "cert-manager.io/v1alpha2" || secret.Type == "cert-manager.io/v1" {
 			caCertPaths = []corev1.KeyToPath{
-				{Key: "ca.crt", Path: fmt.Sprintf("CAs/ca-%d.crt", index)},
+				{Key: certs.CAPublicCertFile, Path: fmt.Sprintf("%s/ca-%d.crt", certs.CertsCADir, index)},
 			}
 		} else {
 			caCertPaths = []corev1.KeyToPath{
-				{Key: "public.crt", Path: fmt.Sprintf("CAs/ca-%d.crt", index)},
+				{Key: certs.PublicCertFile, Path: fmt.Sprintf("%s/ca-%d.crt", certs.CertsCADir, index)},
 			}
 		}
 		certVolumeSources = append(certVolumeSources, corev1.VolumeProjection{
@@ -522,22 +509,6 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 		})
 	}
 
-	if operatorTLS {
-		// Mount Operator TLS certificate to MinIO ~/cert/CAs
-		operatorTLSSecretName := "operator-tls"
-		certVolumeSources = append(certVolumeSources, []corev1.VolumeProjection{
-			{
-				Secret: &corev1.SecretProjection{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: operatorTLSSecretName,
-					},
-					Items: []corev1.KeyToPath{
-						{Key: "public.crt", Path: "CAs/operator.crt"},
-					},
-				},
-			},
-		}...)
-	}
 	// If KES is enable mount TLS certificate secrets
 	if t.HasKESEnabled() {
 		// External Client certificates will have priority over AutoCert generated certificates
@@ -547,13 +518,13 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 			// "cert-manager.io/v1alpha2" / cert-manager.io/v1 because of same keys in both.
 			if t.Spec.ExternalClientCertSecret.Type == "kubernetes.io/tls" || t.Spec.ExternalClientCertSecret.Type == "cert-manager.io/v1alpha2" || t.Spec.KES.ExternalCertSecret.Type == "cert-manager.io/v1" {
 				clientCertPaths = []corev1.KeyToPath{
-					{Key: "tls.crt", Path: "client.crt"},
-					{Key: "tls.key", Path: "client.key"},
+					{Key: certs.TLSCertFile, Path: "client.crt"},
+					{Key: certs.TLSKeyFile, Path: "client.key"},
 				}
 			} else {
 				clientCertPaths = []corev1.KeyToPath{
-					{Key: "public.crt", Path: "client.crt"},
-					{Key: "private.key", Path: "client.key"},
+					{Key: certs.PublicCertFile, Path: "client.crt"},
+					{Key: certs.PrivateKeyFile, Path: "client.key"},
 				}
 			}
 		} else {
@@ -567,7 +538,7 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 			// "cert-manager.io/v1alpha2" because of same keys in both.
 			if t.Spec.KES.ExternalCertSecret.Type == "kubernetes.io/tls" || t.Spec.KES.ExternalCertSecret.Type == "cert-manager.io/v1alpha2" || t.Spec.KES.ExternalCertSecret.Type == "cert-manager.io/v1" {
 				KESCertPath = []corev1.KeyToPath{
-					{Key: "tls.crt", Path: "CAs/kes.crt"},
+					{Key: certs.TLSCertFile, Path: fmt.Sprintf("%s/kes.crt", certs.CertsCADir)},
 				}
 			}
 		} else {
@@ -636,28 +607,24 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 		},
 	}
 	// Copy labels and annotations from the Tenant.Spec.Metadata
-	ssMeta.Labels = t.ObjectMeta.Labels
-	ssMeta.Annotations = t.ObjectMeta.Annotations
-
-	if ssMeta.Labels == nil {
-		ssMeta.Labels = make(map[string]string)
+	// unless `StatefulSetMetadata` is defined, then we'll copy it
+	// from there.
+	if t.Spec.PoolsMetadata != nil {
+		ssMeta.Labels = t.Spec.PoolsMetadata.Labels
+		ssMeta.Annotations = t.Spec.PoolsMetadata.Annotations
 	}
+
+	// Add pool specific annotations
+	ssMeta.Annotations = utils.MergeMaps(ssMeta.Annotations, pool.Annotations)
+	ssMeta.Labels = utils.MergeMaps(ssMeta.Labels, pool.Labels)
 
 	// Add information labels, such as which pool we are building this pod about
 	ssMeta.Labels[miniov2.PoolLabel] = pool.Name
 	ssMeta.Labels[miniov2.TenantLabel] = t.Name
 
-	// Add user specific annotations
-	if pool.Annotations != nil {
-		ssMeta.Annotations = miniov2.MergeMaps(ssMeta.Annotations, pool.Annotations)
-	}
-
-	if pool.Labels != nil {
-		ssMeta.Labels = miniov2.MergeMaps(ssMeta.Labels, pool.Labels)
-	}
-
 	containers := []corev1.Container{
-		poolMinioServerContainer(t, wsSecret, pool, hostsTemplate, operatorVersion, operatorTLS, certVolumeSources),
+		poolMinioServerContainer(t, skipEnvVars, pool, certVolumeSources),
+		getSideCarContainer(t, pool),
 	}
 
 	// attach any sidecar containers and volumes
@@ -666,19 +633,21 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 		podVolumes = append(podVolumes, t.Spec.SideCars.Volumes...)
 	}
 
+	initContainer := getInitContainer(t, pool)
+
 	ss := &appsv1.StatefulSet{
 		ObjectMeta: ssMeta,
 		Spec: appsv1.StatefulSetSpec{
-			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
-				Type: miniov2.DefaultUpdateStrategy,
-			},
 			PodManagementPolicy: t.Spec.PodManagementPolicy,
 			Selector:            ContainerMatchLabels(t, pool),
 			ServiceName:         serviceName,
 			Replicas:            &replicas,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: PodMetadata(t, pool, operatorVersion),
+				ObjectMeta: PodMetadata(t, pool),
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						initContainer,
+					},
 					Containers:                containers,
 					Volumes:                   podVolumes,
 					RestartPolicy:             corev1.RestartPolicyAlways,
@@ -712,5 +681,105 @@ func NewPool(t *miniov2.Tenant, wsSecret *v1.Secret, pool *miniov2.Pool, poolSta
 	if t.Spec.SideCars != nil && len(t.Spec.SideCars.VolumeClaimTemplates) > 0 {
 		ss.Spec.VolumeClaimTemplates = append(ss.Spec.VolumeClaimTemplates, t.Spec.SideCars.VolumeClaimTemplates...)
 	}
+
+	// pass on RuntimeClassName
+	if pool.RuntimeClassName != nil && *pool.RuntimeClassName != "" {
+		ss.Spec.Template.Spec.RuntimeClassName = pool.RuntimeClassName
+	}
+	// add customs initContainers to StatefulSet
+	if len(t.Spec.InitContainers) != 0 {
+		ss.Spec.Template.Spec.InitContainers = append(ss.Spec.Template.Spec.InitContainers, t.Spec.InitContainers...)
+	}
+	// add customs VolumeMounts and Volumes.
+	if len(t.Spec.AdditionalVolumeMounts) != 0 && len(t.Spec.AdditionalVolumes) == len(t.Spec.AdditionalVolumeMounts) {
+		for i := range ss.Spec.Template.Spec.InitContainers {
+			ss.Spec.Template.Spec.InitContainers[i].VolumeMounts = append(ss.Spec.Template.Spec.InitContainers[i].VolumeMounts, t.Spec.AdditionalVolumeMounts...)
+		}
+		for i := range ss.Spec.Template.Spec.Containers {
+			ss.Spec.Template.Spec.Containers[i].VolumeMounts = append(ss.Spec.Template.Spec.Containers[i].VolumeMounts, t.Spec.AdditionalVolumeMounts...)
+		}
+		ss.Spec.Template.Spec.Volumes = append(ss.Spec.Template.Spec.Volumes, t.Spec.AdditionalVolumes...)
+	}
 	return ss
+}
+
+func getInitContainer(t *miniov2.Tenant, pool *miniov2.Pool) corev1.Container {
+	initContainer := corev1.Container{
+		Name:  "validate-arguments",
+		Image: getSidecarImage(),
+		Args: []string{
+			"validate",
+			"--tenant",
+			t.Name,
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "CLUSTER_DOMAIN",
+				Value: miniov2.GetClusterDomain(),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			CfgVolumeMount,
+		},
+		SecurityContext: poolContainerSecurityContext(pool),
+	}
+	// That's ok to use the sidecar's resource
+	if t.Spec.SideCars != nil && t.Spec.SideCars.Resources != nil {
+		initContainer.Resources = *t.Spec.SideCars.Resources
+	}
+	if t.HasConfigurationSecret() {
+		initContainer.VolumeMounts = append(initContainer.VolumeMounts, TmpCfgVolumeMount)
+	}
+	return initContainer
+}
+
+func getSideCarContainer(t *miniov2.Tenant, pool *miniov2.Pool) corev1.Container {
+	scheme := corev1.URISchemeHTTP
+
+	readinessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/ready",
+				Port: intstr.IntOrString{
+					IntVal: 4444,
+				},
+				// Host:        "localhost",
+				Scheme:      scheme,
+				HTTPHeaders: nil,
+			},
+		},
+		InitialDelaySeconds: 5,
+		PeriodSeconds:       1,
+		FailureThreshold:    1,
+	}
+
+	sidecarContainer := corev1.Container{
+		Name:  "sidecar",
+		Image: getSidecarImage(),
+		Args: []string{
+			"sidecar",
+			"--tenant",
+			t.Name,
+			"--config-name",
+			t.Spec.Configuration.Name,
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "CLUSTER_DOMAIN",
+				Value: miniov2.GetClusterDomain(),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			CfgVolumeMount,
+		},
+		SecurityContext: poolContainerSecurityContext(pool),
+		ReadinessProbe:  readinessProbe,
+	}
+	if t.Spec.SideCars != nil && t.Spec.SideCars.Resources != nil {
+		sidecarContainer.Resources = *t.Spec.SideCars.Resources
+	}
+	if t.HasConfigurationSecret() {
+		sidecarContainer.VolumeMounts = append(sidecarContainer.VolumeMounts, TmpCfgVolumeMount)
+	}
+	return sidecarContainer
 }

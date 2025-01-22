@@ -24,18 +24,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"text/template"
 	"time"
+
+	"github.com/minio/operator/pkg/certs"
+
+	"github.com/miekg/dns"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -44,30 +48,23 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/golang-jwt/jwt"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
 // Webhook API constants
 const (
-	WebhookAPIVersion       = "/webhook/v1"
-	WebhookDefaultPort      = "4222"
-	WebhookSecret           = "operator-webhook-secret"
-	WebhookOperatorUsername = "webhookUsername"
-	WebhookOperatorPassword = "webhookPassword"
-
-	// Webhook environment variable constants
-	WebhookMinIOArgs   = "MINIO_ARGS"
-	WebhookMinIOBucket = "MINIO_DNS_WEBHOOK_ENDPOINT"
+	MinIOServerURL          = "MINIO_SERVER_URL"
+	MinIODomain             = "MINIO_DOMAIN"
+	MinIOBrowserRedirectURL = "MINIO_BROWSER_REDIRECT_URL"
 
 	defaultPrometheusJWTExpiry = 100 * 365 * 24 * time.Hour
 )
 
 // envGet retrieves the value of the environment variable named
 // by the key. If the variable is present in the environment the
-// value (which may be empty) is returned. Otherwise it returns
+// value (which may be empty) is returned. Otherwise, it returns
 // the specified default value.
 func envGet(key, defaultValue string) string {
 	if v, ok := os.LookupEnv(key); ok {
@@ -75,14 +72,6 @@ func envGet(key, defaultValue string) string {
 	}
 	return defaultValue
 }
-
-// List of webhook APIs
-const (
-	WebhookAPIGetenv        = WebhookAPIVersion + "/getenv"
-	WebhookAPIBucketService = WebhookAPIVersion + "/bucketsrv"
-	WebhookAPIUpdate        = WebhookAPIVersion + "/update"
-	WebhookCRDConversaion   = WebhookAPIVersion + "/crd-conversion"
-)
 
 type hostsTemplateValues struct {
 	StatefulSet string
@@ -105,22 +94,39 @@ var (
 	prometheusName          string
 	prometheusNamespaceOnce sync.Once
 	prometheusNameOnce      sync.Once
+	// gcpAppCredentialENV to denote the GCP APP credential path
+	gcpAppCredentialENV = corev1.EnvVar{
+		Name:  "GOOGLE_APPLICATION_CREDENTIALS",
+		Value: "/var/run/secrets/tokens/gcp-ksa/google-application-credentials.json",
+	}
 )
 
 // GetPodCAFromFile assumes the operator is running inside a k8s pod and extract the
 // current ca certificate from /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 func GetPodCAFromFile() []byte {
-	namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+	cert, err := os.ReadFile(fmt.Sprintf("/var/run/secrets/kubernetes.io/serviceaccount/%s", certs.CAPublicCertFile))
 	if err != nil {
 		return nil
 	}
-	return namespace
+	return cert
+}
+
+// GetPublicCertFilePath return the path to the certificate file based for the serviceName
+func GetPublicCertFilePath(serviceName string) string {
+	publicCertPath := fmt.Sprintf("/tmp/%s/%s", serviceName, certs.PublicCertFile)
+	return publicCertPath
+}
+
+// GetPrivateKeyFilePath return the path to the key file based for the serviceName
+func GetPrivateKeyFilePath(serviceName string) string {
+	privateKey := fmt.Sprintf("/tmp/%s/%s", serviceName, certs.PrivateKeyFile)
+	return privateKey
 }
 
 // GetNSFromFile assumes the operator is running inside a k8s pod and extract the
 // current namespace from the /var/run/secrets/kubernetes.io/serviceaccount/namespace file
 func GetNSFromFile() string {
-	namespace, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	namespace, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 	if err != nil {
 		return "minio-operator"
 	}
@@ -130,12 +136,6 @@ func GetNSFromFile() string {
 // ellipsis returns the host range string
 func genEllipsis(start, end int) string {
 	return "{" + strconv.Itoa(start) + "..." + strconv.Itoa(end) + "}"
-}
-
-// HasCredsSecret returns true if the user has provided a secret
-// for a Tenant else false
-func (t *Tenant) HasCredsSecret() bool {
-	return t.Spec.CredsSecret != nil && t.Spec.CredsSecret.Name != ""
 }
 
 // HasConfigurationSecret returns true if the user has provided a configuration
@@ -166,6 +166,11 @@ func (t *Tenant) ExternalCaCerts() bool {
 // that contains CA client cert, server cert and server key
 func (t *Tenant) ExternalClientCert() bool {
 	return t.Spec.ExternalClientCertSecret != nil && t.Spec.ExternalClientCertSecret.Name != ""
+}
+
+// ExternalClientCerts returns true is the user has provided additional client certificates
+func (t *Tenant) ExternalClientCerts() bool {
+	return len(t.Spec.ExternalClientCertSecrets) > 0
 }
 
 // KESExternalCert returns true is the user has provided a secret
@@ -212,26 +217,23 @@ func (t *Tenant) KESReplicas() int32 {
 const (
 	minioReleaseTagTimeLayout       = "2006-01-02T15-04-05Z"
 	minioReleaseTagTimeLayoutBackup = "2006-01-02T15:04:05Z"
-	releasePrefix                   = "RELEASE"
 )
 
 // ReleaseTagToReleaseTime - converts a 'RELEASE.2017-09-29T19-16-56Z.hotfix' into the build time
 func ReleaseTagToReleaseTime(releaseTag string) (releaseTime time.Time, err error) {
 	fields := strings.Split(releaseTag, ".")
-	if len(fields) == 1 {
-		releaseTime, err = time.Parse(minioReleaseTagTimeLayout, fields[0])
-		if err != nil {
-			return time.Parse(minioReleaseTagTimeLayoutBackup, fields[0])
-		}
-		return releaseTime, nil
+	if len(fields) < 1 {
+		return releaseTime, fmt.Errorf("%s not a valid release tag", releaseTag)
 	}
-	if len(fields) < 2 || len(fields) > 3 {
-		return releaseTime, fmt.Errorf("%s is not a valid release tag", releaseTag)
+	releaseTimeStr := fields[0]
+	if len(fields) > 1 {
+		releaseTimeStr = fields[1]
 	}
-	if fields[0] != releasePrefix {
-		return releaseTime, fmt.Errorf("%s is not a valid release tag", releaseTag)
+	releaseTime, err = time.Parse(minioReleaseTagTimeLayout, releaseTimeStr)
+	if err != nil {
+		return time.Parse(minioReleaseTagTimeLayoutBackup, releaseTimeStr)
 	}
-	return time.Parse(minioReleaseTagTimeLayout, fields[1])
+	return releaseTime, nil
 }
 
 // ExtractTar extracts all tar files from the list `filesToExtract` and puts the files in the `basePath` location
@@ -267,6 +269,9 @@ func ExtractTar(filesToExtract []string, basePath, tarFileName string) error {
 		}
 
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("Tar file contains only %d out of %d files", len(filesToExtract)-success, len(filesToExtract))
+			}
 			return fmt.Errorf("Tar file extraction failed for file index: %d, with: %w", success, err)
 		}
 		if header.Typeflag == tar.TypeReg {
@@ -361,32 +366,14 @@ func (t *Tenant) EnsureDefaults() *Tenant {
 		if t.Spec.KES.KeyName == "" {
 			t.Spec.KES.KeyName = KESMinIOKey
 		}
-	}
-
-	if t.HasPrometheusEnabled() {
-		if t.Spec.Prometheus.Image == "" {
-			t.Spec.Prometheus.Image = PrometheusImage
-		}
-		if t.Spec.Prometheus.SideCarImage == "" {
-			t.Spec.Prometheus.SideCarImage = PrometheusSideCarImage
-		}
-		if t.Spec.Prometheus.InitImage == "" {
-			t.Spec.Prometheus.InitImage = PrometheusInitImage
+		if t.HasGCPCredentialSecretForKES() && t.Spec.KES.ServiceAccountName == "" {
+			t.Spec.KES.ServiceAccountName = "default"
 		}
 	}
 
-	if t.HasLogEnabled() {
-		if t.Spec.Log.Image == "" {
-			t.Spec.Log.Image = DefaultLogSearchAPIImage
-		}
-		if t.Spec.Log.Db != nil {
-			if t.Spec.Log.Db.Image == "" {
-				t.Spec.Log.Db.Image = LogPgImage
-			}
-			if t.Spec.Log.Db.InitImage == "" {
-				t.Spec.Log.Db.InitImage = InitContainerImage
-			}
-		}
+	// ServiceAccount
+	if t.Spec.ServiceAccountName == "" {
+		t.Spec.ServiceAccountName = fmt.Sprintf("%s-sa", t.Name)
 	}
 
 	return t
@@ -429,13 +416,8 @@ func (t *Tenant) GenBearerToken(accessKey, secretKey string) string {
 // MinIOHosts returns the domain names in ellipses format created for current Tenant
 func (t *Tenant) MinIOHosts() (hosts []string) {
 	// Create the ellipses style URL
-	for pi, pool := range t.Spec.Pools {
-		// determine the proper statefulset name
+	for _, pool := range t.Spec.Pools {
 		ssName := t.PoolStatefulsetName(&pool)
-		if len(t.Status.Pools) > pi {
-			ssName = t.Status.Pools[pi].SSName
-		}
-
 		if pool.Servers == 1 {
 			hosts = append(hosts, fmt.Sprintf("%s-%s.%s.%s.svc.%s", ssName, "0", t.MinIOHLServiceName(), t.Namespace, GetClusterDomain()))
 		} else {
@@ -527,23 +509,12 @@ func (t *Tenant) KESServiceHost() string {
 
 // BucketDNS indicates if Bucket DNS feature is enabled.
 func (t *Tenant) BucketDNS() bool {
-	// we've deprecated .spec.s3 and will top working in future releases of operator
-	return (t.Spec.Features != nil && t.Spec.Features.BucketDNS) || (t.Spec.S3 != nil && t.Spec.S3.BucketDNS)
+	return (t.Spec.Features != nil && t.Spec.Features.BucketDNS)
 }
 
 // HasKESEnabled checks if kes configuration is provided by user
 func (t *Tenant) HasKESEnabled() bool {
 	return t.Spec.KES != nil
-}
-
-// HasLogEnabled checks if Log feature has been enabled
-func (t *Tenant) HasLogEnabled() bool {
-	return t.Spec.Log != nil
-}
-
-// HasPrometheusEnabled checks if Prometheus metrics has been enabled
-func (t *Tenant) HasPrometheusEnabled() bool {
-	return t.Spec.Prometheus != nil
 }
 
 // HasPrometheusOperatorEnabled checks if Prometheus service monitor has been enabled
@@ -556,8 +527,30 @@ func (t *Tenant) GetEnvVars() (env []corev1.EnvVar) {
 	return t.Spec.Env
 }
 
+// HasGCPCredentialSecretForKES returns if GCP cred secret is set in KES for fleet workload identity support.
+func (t *Tenant) HasGCPCredentialSecretForKES() bool {
+	return t.HasKESEnabled() && t.Spec.KES.GCPCredentialSecretName != ""
+}
+
+// HasGCPWorkloadIdentityPoolForKES returns if GCP worload identity pool secret is set in KES for fleet workload identity support.
+func (t *Tenant) HasGCPWorkloadIdentityPoolForKES() bool {
+	return t.HasKESEnabled() && t.Spec.KES.GCPWorkloadIdentityPool != ""
+}
+
+// GetKESEnvVars returns the environment variables for the KES deployment.
+func (t *Tenant) GetKESEnvVars() (env []corev1.EnvVar) {
+	if !t.HasKESEnabled() {
+		return env
+	}
+	env = t.Spec.KES.Env
+	if t.HasGCPCredentialSecretForKES() {
+		env = append(env, gcpAppCredentialENV)
+	}
+	return env
+}
+
 // UpdateURL returns the URL for the sha256sum location of the new binary
-func (t *Tenant) UpdateURL(lrTime time.Time, overrideURL string) (string, error) {
+func (t *Tenant) UpdateURL(ltag string, overrideURL string) (string, error) {
 	if overrideURL == "" {
 		overrideURL = DefaultMinIOUpdateURL
 	}
@@ -565,7 +558,7 @@ func (t *Tenant) UpdateURL(lrTime time.Time, overrideURL string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	u.Path = u.Path + "/minio." + releasePrefix + "." + lrTime.Format(minioReleaseTagTimeLayout) + ".sha256sum"
+	u.Path = u.Path + "/minio." + ltag + ".sha256sum"
 	return u.String(), nil
 }
 
@@ -614,21 +607,18 @@ func (t *Tenant) MinIOHealthCheck(tr *http.Transport) bool {
 		tr.TLSClientConfig.InsecureSkipVerify = true
 	}
 
-	req, err := http.NewRequest(http.MethodGet, t.MinIOServerEndpoint()+"/minio/health/cluster", nil)
+	clnt, err := madmin.NewAnonymousClient(t.MinIOServerHostAddress(), t.TLS())
+	if err != nil {
+		return false
+	}
+	clnt.SetCustomTransport(tr)
+
+	result, err := clnt.Healthy(context.Background(), madmin.HealthOpts{})
 	if err != nil {
 		return false
 	}
 
-	httpClient := &http.Client{
-		Transport: tr,
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return false
-	}
-
-	return resp.StatusCode == http.StatusOK
+	return result.Healthy
 }
 
 // NewMinIOAdmin initializes a new madmin.Client for operator interaction
@@ -679,49 +669,26 @@ func (t *Tenant) getMinIOTenantDetails(address string, minioSecret map[string][]
 }
 
 // NewMinIOUser initializes a new console user
-func (t *Tenant) NewMinIOUser(userCredentialSecrets []*corev1.Secret, tr *http.Transport) (*minio.Client, error) {
-	return t.NewMinIOUserForAddress("", userCredentialSecrets, tr)
+func (t *Tenant) NewMinIOUser(minioSecret map[string][]byte, tr *http.Transport) (*minio.Client, error) {
+	return t.NewMinIOUserForAddress("", minioSecret, tr)
 }
 
 // NewMinIOUserForAddress initializes a new console user
-func (t *Tenant) NewMinIOUserForAddress(address string, userCredentialSecrets []*corev1.Secret, tr *http.Transport) (*minio.Client, error) {
-	host := address
-	if host == "" {
-		host = t.MinIOServerHostAddress()
-		if host == "" {
-			return nil, errors.New("MinIO server host is empty")
-		}
+func (t *Tenant) NewMinIOUserForAddress(address string, minioSecret map[string][]byte, tr *http.Transport) (*minio.Client, error) {
+	host, accessKey, secretKey, err := t.getMinIOTenantDetails(address, minioSecret)
+	if err != nil {
+		return nil, err
 	}
-
-	for _, cred := range userCredentialSecrets {
-		consoleAccessKey, ok := cred.Data["CONSOLE_ACCESS_KEY"]
-		if !ok {
-			return nil, errors.New("CONSOLE_ACCESS_KEY not provided")
-		}
-		// remove spaces and line breaks from access key
-		userAccessKey := strings.TrimSpace(string(consoleAccessKey))
-		consoleSecretKey, ok := cred.Data["CONSOLE_SECRET_KEY"]
-		// remove spaces and line breaks from secret key
-		userSecretKey := strings.TrimSpace(string(consoleSecretKey))
-		if !ok {
-			return nil, errors.New("CONSOLE_SECRET_KEY not provided")
-		}
-
-		opts := &minio.Options{
-			Transport: tr,
-			Secure:    t.TLS(),
-			Creds:     credentials.NewStaticV4(userAccessKey, userSecretKey, ""),
-		}
-
-		minioClnt, err := minio.New(host, opts)
-		if err != nil {
-			return nil, err
-		}
-
-		return minioClnt, nil
+	opts := &minio.Options{
+		Transport: tr,
+		Secure:    t.TLS(),
+		Creds:     credentials.NewStaticV4(string(accessKey), string(secretKey), ""),
 	}
-
-	return nil, errors.New("no user credentials specified to initialize")
+	minioClient, err := minio.New(host, opts)
+	if err != nil {
+		return nil, err
+	}
+	return minioClient, nil
 }
 
 // MustGetSystemCertPool - return system CAs or empty pool in case of error (or windows)
@@ -733,20 +700,12 @@ func MustGetSystemCertPool() *x509.CertPool {
 	return pool
 }
 
-// IsLDAPEnabled ldap enabled
-func (t *Tenant) IsLDAPEnabled() bool {
-	for _, env := range t.GetEnvVars() {
-		if env.Name == "MINIO_IDENTITY_LDAP_SERVER_ADDR" && env.Value != "" {
-			return true
-		}
-	}
-	return false
-}
-
 // CreateUsers creates a list of admin users on MinIO, optionally creating users is disabled.
-func (t *Tenant) CreateUsers(madmClnt *madmin.AdminClient, userCredentialSecrets []*corev1.Secret) error {
-	skipCreateUser := t.IsLDAPEnabled() // Skip creating users if LDAP is enabled.
-
+func (t *Tenant) CreateUsers(madmClnt *madmin.AdminClient, userCredentialSecrets []*corev1.Secret, tenantConfiguration map[string][]byte) error {
+	var skipCreateUser bool // Skip creating users if LDAP is enabled.
+	if ldapAddress, ok := tenantConfiguration["MINIO_IDENTITY_LDAP_SERVER_ADDR"]; ok {
+		skipCreateUser = string(ldapAddress) != ""
+	}
 	// add user with a 20 seconds timeout
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
 	defer cancel()
@@ -778,27 +737,27 @@ func (t *Tenant) CreateUsers(madmClnt *madmin.AdminClient, userCredentialSecrets
 }
 
 // CreateBuckets creates buckets and skips if bucket already present
-func (t *Tenant) CreateBuckets(minioClient *minio.Client, buckets ...Bucket) error {
+func (t *Tenant) CreateBuckets(minioClient *minio.Client, buckets ...Bucket) (created bool, err error) {
+	createBucketCount := 0
 	for _, bucket := range buckets {
-		if err := s3utils.CheckValidBucketName(bucket.Name); err != nil {
-			return err
-		}
 		// create each bucket with a 20 seconds timeout
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
 		defer cancel()
-		if err := minioClient.MakeBucket(ctx, bucket.Name, minio.MakeBucketOptions{
+		if err = minioClient.MakeBucket(ctx, bucket.Name, minio.MakeBucketOptions{
 			Region:        bucket.Region,
 			ObjectLocking: bucket.ObjectLocking,
 		}); err != nil {
 			switch minio.ToErrorResponse(err).Code {
 			case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
-				klog.Infof(err.Error())
 				continue
+			default:
+				return false, err
 			}
 		}
+		createBucketCount++
 		klog.Infof("Successfully created bucket %s", bucket.Name)
 	}
-	return nil
+	return createBucketCount > 0, nil
 }
 
 // Validate validate single pool as per MinIO deployment requirements
@@ -816,12 +775,10 @@ func (z *Pool) Validate(zi int) error {
 	if z.Servers*z.VolumesPerServer < 4 {
 		// Erasure coding has few requirements.
 		switch z.Servers {
-		case 1:
-			return fmt.Errorf("pool #%d setup must have a minimum of 4 volumes per server", zi)
 		case 2:
-			return fmt.Errorf("pool #%d setup must have a minimum of 2 volumes per server", zi)
+			return fmt.Errorf("pool #%d with 2 servers must have at least 4 volumes in total", zi)
 		case 3:
-			return fmt.Errorf("pool #%d setup must have a minimum of 2 volumes per server", zi)
+			return fmt.Errorf("pool #%d with 3 servers must have at least 6 volumes in total", zi)
 		}
 	}
 
@@ -859,8 +816,18 @@ func (t *Tenant) Validate() error {
 		return errors.New("pools must be configured")
 	}
 
-	if t.Spec.CredsSecret == nil {
-		return errors.New("please set credsSecret secret with credentials for Tenant")
+	if !t.HasConfigurationSecret() {
+		return errors.New("please set 'configuration' secret with credentials for Tenant")
+	}
+
+	if t.HasKESEnabled() {
+		switch {
+		case t.HasGCPCredentialSecretForKES() && !t.HasGCPWorkloadIdentityPoolForKES():
+			return errors.New("please set 'gcpWorkloadIdentityPool' to enable fleet workload identity")
+		case t.HasGCPWorkloadIdentityPoolForKES() && !t.HasGCPCredentialSecretForKES():
+			return errors.New("plese set the 'gcpCredentialSecretName' to enable fleet workload identity")
+		default:
+		}
 	}
 
 	// Every pool must contain a Volume Claim Template
@@ -868,6 +835,10 @@ func (t *Tenant) Validate() error {
 		if err := pool.Validate(zi); err != nil {
 			return err
 		}
+	}
+	// make sure all the domains are valid
+	if err := t.ValidateDomains(); err != nil {
+		return err
 	}
 
 	return nil
@@ -907,14 +878,6 @@ func GetClusterDomain() string {
 	return k8sClusterDomain
 }
 
-// MergeMaps merges two maps and returns the union
-func MergeMaps(a, b map[string]string) map[string]string {
-	for k, v := range b {
-		a[k] = v
-	}
-	return a
-}
-
 // ToMap converts a slice of env vars to a map of Name and value
 func ToMap(envs []corev1.EnvVar) map[string]string {
 	newMap := make(map[string]string)
@@ -922,6 +885,29 @@ func ToMap(envs []corev1.EnvVar) map[string]string {
 		newMap[envs[i].Name] = envs[i].Value
 	}
 	return newMap
+}
+
+// IsContainersEnvUpdated compare environment variables of existing and expected containers and
+// returns true if there is a change
+func IsContainersEnvUpdated(existingContainers, expectedContainers []corev1.Container) bool {
+	// compare containers environment variables
+	expectedContainersEnvVars := map[string][]corev1.EnvVar{}
+	existingContainersEnvVars := map[string][]corev1.EnvVar{}
+	for _, c := range existingContainers {
+		existingContainersEnvVars[c.Name] = c.Env
+	}
+	for _, c := range expectedContainers {
+		expectedContainersEnvVars[c.Name] = c.Env
+	}
+	for key := range expectedContainersEnvVars {
+		if _, ok := existingContainersEnvVars[key]; !ok {
+			return true
+		}
+		if IsEnvUpdated(ToMap(existingContainersEnvVars[key]), ToMap(expectedContainersEnvVars[key])) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsEnvUpdated looks for new env vars in the old env vars and returns true if
@@ -979,29 +965,81 @@ func (t *Tenant) GetTenantServiceURL() (svcURL string) {
 	return fmt.Sprintf("%s://%s", scheme, svc)
 }
 
+type envKV struct {
+	Key   string
+	Value string
+	Skip  bool
+}
+
+func (e envKV) String() string {
+	if e.Skip {
+		return ""
+	}
+	return fmt.Sprintf("%s=%s", e.Key, e.Value)
+}
+
+func parsEnvEntry(envEntry string) (envKV, error) {
+	envEntry = strings.TrimSpace(envEntry)
+	if envEntry == "" {
+		// Skip all empty lines
+		return envKV{
+			Skip: true,
+		}, nil
+	}
+	if strings.HasPrefix(envEntry, "#") {
+		// Skip commented lines
+		return envKV{
+			Skip: true,
+		}, nil
+	}
+	const envSeparator = "="
+	envTokens := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(envEntry, "export")), envSeparator, 2)
+	if len(envTokens) != 2 {
+		return envKV{}, fmt.Errorf("envEntry malformed; %s, expected to be of form 'KEY=value'", envEntry)
+	}
+
+	key := envTokens[0]
+	val := envTokens[1]
+
+	// Remove quotes from the value if found
+	if len(val) >= 2 {
+		quote := val[0]
+		if (quote == '"' || quote == '\'') && val[len(val)-1] == quote {
+			val = val[1 : len(val)-1]
+		}
+	}
+
+	return envKV{
+		Key:   key,
+		Value: val,
+	}, nil
+}
+
 // ParseRawConfiguration map[string][]byte representation of the MinIO config.env file
 func ParseRawConfiguration(configuration []byte) (config map[string][]byte) {
 	config = map[string][]byte{}
 	if configuration != nil {
 		scanner := bufio.NewScanner(strings.NewReader(string(configuration)))
 		for scanner.Scan() {
-			line := scanner.Text()
-			// parse only exported environment variables and ignore everything else
-			if strings.HasPrefix(line, "export") {
-				envVar := strings.Split(line, "=")
-				if len(envVar) == 2 {
-					// extract env variable key
-					confKey := strings.TrimSpace(strings.TrimPrefix(envVar[0], "export"))
-					// remove first and last quotes from value and trim spaces
-					confValue := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(envVar[1], "\""), "\""))
-					config[confKey] = []byte(confValue)
-					if confKey == "MINIO_ROOT_USER" || confKey == "MINIO_ACCESS_KEY" {
-						config["accesskey"] = config[confKey]
-					} else if confKey == "MINIO_ROOT_PASSWORD" || confKey == "MINIO_SECRET_KEY" {
-						config["secretkey"] = config[confKey]
-					}
-				}
+			ekv, err := parsEnvEntry(scanner.Text())
+			if err != nil {
+				klog.Errorf("Error parsing tenant configuration: %v", err.Error())
+				continue
 			}
+			if ekv.Skip {
+				// Skips empty lines
+				continue
+			}
+			config[ekv.Key] = []byte(ekv.Value)
+			if ekv.Key == "MINIO_ROOT_USER" || ekv.Key == "MINIO_ACCESS_KEY" {
+				config["accesskey"] = config[ekv.Key]
+			} else if ekv.Key == "MINIO_ROOT_PASSWORD" || ekv.Key == "MINIO_SECRET_KEY" {
+				config["secretkey"] = config[ekv.Key]
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			klog.Errorf("Error parsing tenant configuration: %v", err.Error())
+			return config
 		}
 	}
 	return config
@@ -1018,7 +1056,7 @@ func GetPrometheusNamespace() string {
 // GetPrometheusName returns namespace of the prometheus managed by prometheus operator
 func GetPrometheusName() string {
 	prometheusNameOnce.Do(func() {
-		prometheusName = envGet(prometheusName, "")
+		prometheusName = envGet(PrometheusName, "")
 	})
 	return prometheusName
 }
@@ -1026,4 +1064,155 @@ func GetPrometheusName() string {
 // HasMinIODomains indicates whether domains are being specified for MinIO
 func (t *Tenant) HasMinIODomains() bool {
 	return t.Spec.Features != nil && t.Spec.Features.Domains != nil && len(t.Spec.Features.Domains.Minio) > 0
+}
+
+// HasConsoleDomains indicates whether a domain is being specified for Console
+func (t *Tenant) HasConsoleDomains() bool {
+	return t.Spec.Features != nil && t.Spec.Features.Domains != nil && t.Spec.Features.Domains.Console != ""
+}
+
+// ValidateDomains checks the validity of the domains configured on the tenant
+func (t *Tenant) ValidateDomains() error {
+	if t.HasMinIODomains() {
+		domains := t.Spec.Features.Domains.Minio
+		var globalDomains []string
+		if len(domains) != 0 {
+			for _, domain := range domains {
+				// Infer schema from tenant TLS, if not explicit
+				if !strings.HasPrefix(domain, "http") {
+					useSchema := "http"
+					if t.TLS() {
+						useSchema = "https"
+					}
+					domain = fmt.Sprintf("%s://%s", useSchema, domain)
+				}
+
+				u, err := url.Parse(domain)
+				if err != nil {
+					return err
+				}
+
+				if _, ok := dns.IsDomainName(domain); !ok {
+					return fmt.Errorf("invalid domain `%s`", domain)
+				}
+
+				// Remove ports if any
+				domain := strings.Split(u.Host, ":")[0]
+				globalDomains = append(globalDomains, domain)
+			}
+			sort.Strings(globalDomains)
+			lcpSuf := lcpSuffix(globalDomains)
+			for _, domain := range globalDomains {
+				if domain == lcpSuf && len(globalDomains) > 1 {
+					return fmt.Errorf("overlapping domains `%s` not allowed", domain)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GetDomainHosts returns a list of hosts in the .spec.features.domains.minio list to configure MINIO_DOMAIN
+func (t *Tenant) GetDomainHosts() []string {
+	if t.HasMinIODomains() {
+		domains := t.Spec.Features.Domains.Minio
+		var hosts []string
+		for _, domain := range domains {
+			// Infer schema from tenant TLS, if not explicit
+			if !strings.HasPrefix(domain, "http") {
+				useSchema := "http"
+				if t.TLS() {
+					useSchema = "https"
+				}
+				domain = fmt.Sprintf("%s://%s", useSchema, domain)
+			}
+
+			if _, ok := dns.IsDomainName(domain); !ok {
+				continue
+			}
+
+			u, err := url.Parse(domain)
+			if err != nil {
+				continue
+			}
+
+			// Remove ports if any
+			host := strings.Split(u.Host, ":")[0]
+			hosts = append(hosts, host)
+		}
+		return hosts
+	}
+	return nil
+}
+
+// HasEnv returns whether an environment variable is defined in the .spec.env field
+func (t *Tenant) HasEnv(envName string) bool {
+	for _, env := range t.Spec.Env {
+		if env.Name == envName {
+			return true
+		}
+	}
+	return false
+}
+
+// Suffix returns the longest common suffix of the provided strings
+func lcpSuffix(strs []string) string {
+	return lcp(strs, false)
+}
+
+func lcp(strs []string, pre bool) string {
+	// short-circuit empty list
+	if len(strs) == 0 {
+		return ""
+	}
+	xfix := strs[0]
+	// short-circuit single-element list
+	if len(strs) == 1 {
+		return xfix
+	}
+	// compare first to rest
+	for _, str := range strs[1:] {
+		xfixl := len(xfix)
+		strl := len(str)
+		// short-circuit empty strings
+		if xfixl == 0 || strl == 0 {
+			return ""
+		}
+		// maximum possible length
+		maxl := xfixl
+		if strl < maxl {
+			maxl = strl
+		}
+		// compare letters
+		if pre {
+			// prefix, iterate left to right
+			for i := 0; i < maxl; i++ {
+				if xfix[i] != str[i] {
+					xfix = xfix[:i]
+					break
+				}
+			}
+		} else {
+			// suffix, iterate right to left
+			for i := 0; i < maxl; i++ {
+				xi := xfixl - i - 1
+				si := strl - i - 1
+				if xfix[xi] != str[si] {
+					xfix = xfix[xi+1:]
+					break
+				}
+			}
+		}
+	}
+	return xfix
+}
+
+// GetRoleName returns the role name we will use for the tenant
+func (t *Tenant) GetRoleName() string {
+	return fmt.Sprintf("%s-role", t.Name)
+}
+
+// GetBindingName returns the binding name we will use for the tenant
+func (t *Tenant) GetBindingName() string {
+	return fmt.Sprintf("%s-binding", t.Name)
 }

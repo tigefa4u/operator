@@ -3,7 +3,3 @@ kind: Kustomization
 
 resources:
   - ../../examples/kustomization/tenant-lite
-
-patchesStrategicMerge:
-  - tenant.yaml
-

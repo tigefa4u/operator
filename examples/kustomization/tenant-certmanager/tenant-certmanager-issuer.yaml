@@ -1,0 +1,8 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: tenant-certmanager-issuer
+  namespace: tenant-certmanager
+spec:
+  ca:
+    secretName: tenant-certmanager-ca-tls

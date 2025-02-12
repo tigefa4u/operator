@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tenant-certmanager-kes
+
+resources:
+- ../cert-manager
+- myminio-kes-certificate.yaml
+- vault.yaml
+- ../tenant-kes-encryption
+
+patches:
+- path: tenant.yaml

@@ -1,5 +1,5 @@
 // This file is part of MinIO Operator
-// Copyright (c) 2021 MinIO, Inc.
+// Copyright (c) 2024 MinIO, Inc.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -19,11 +19,14 @@
 package fake
 
 import (
+	applyconfiguration "github.com/minio/operator/pkg/client/applyconfiguration"
 	clientset "github.com/minio/operator/pkg/client/clientset/versioned"
-	miniov1 "github.com/minio/operator/pkg/client/clientset/versioned/typed/minio.min.io/v1"
-	fakeminiov1 "github.com/minio/operator/pkg/client/clientset/versioned/typed/minio.min.io/v1/fake"
 	miniov2 "github.com/minio/operator/pkg/client/clientset/versioned/typed/minio.min.io/v2"
 	fakeminiov2 "github.com/minio/operator/pkg/client/clientset/versioned/typed/minio.min.io/v2/fake"
+	stsv1alpha1 "github.com/minio/operator/pkg/client/clientset/versioned/typed/sts.min.io/v1alpha1"
+	fakestsv1alpha1 "github.com/minio/operator/pkg/client/clientset/versioned/typed/sts.min.io/v1alpha1/fake"
+	stsv1beta1 "github.com/minio/operator/pkg/client/clientset/versioned/typed/sts.min.io/v1beta1"
+	fakestsv1beta1 "github.com/minio/operator/pkg/client/clientset/versioned/typed/sts.min.io/v1beta1/fake"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
@@ -33,8 +36,12 @@ import (
 
 // NewSimpleClientset returns a clientset that will respond with the provided objects.
 // It's backed by a very simple object tracker that processes creates, updates and deletions as-is,
-// without applying any validations and/or defaults. It shouldn't be considered a replacement
+// without applying any field management, validations and/or defaults. It shouldn't be considered a replacement
 // for a real clientset and is mostly useful in simple unit tests.
+//
+// DEPRECATED: NewClientset replaces this with support for field management, which significantly improves
+// server side apply testing. NewClientset is only available when apply configurations are generated (e.g.
+// via --with-applyconfig).
 func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 	o := testing.NewObjectTracker(scheme, codecs.UniversalDecoder())
 	for _, obj := range objects {
@@ -76,14 +83,54 @@ func (c *Clientset) Tracker() testing.ObjectTracker {
 	return c.tracker
 }
 
-var _ clientset.Interface = &Clientset{}
+// NewClientset returns a clientset that will respond with the provided objects.
+// It's backed by a very simple object tracker that processes creates, updates and deletions as-is,
+// without applying any validations and/or defaults. It shouldn't be considered a replacement
+// for a real clientset and is mostly useful in simple unit tests.
+func NewClientset(objects ...runtime.Object) *Clientset {
+	o := testing.NewFieldManagedObjectTracker(
+		scheme,
+		codecs.UniversalDecoder(),
+		applyconfiguration.NewTypeConverter(scheme),
+	)
+	for _, obj := range objects {
+		if err := o.Add(obj); err != nil {
+			panic(err)
+		}
+	}
 
-// MinioV1 retrieves the MinioV1Client
-func (c *Clientset) MinioV1() miniov1.MinioV1Interface {
-	return &fakeminiov1.FakeMinioV1{Fake: &c.Fake}
+	cs := &Clientset{tracker: o}
+	cs.discovery = &fakediscovery.FakeDiscovery{Fake: &cs.Fake}
+	cs.AddReactor("*", "*", testing.ObjectReaction(o))
+	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
+		gvr := action.GetResource()
+		ns := action.GetNamespace()
+		watch, err := o.Watch(gvr, ns)
+		if err != nil {
+			return false, nil, err
+		}
+		return true, watch, nil
+	})
+
+	return cs
 }
+
+var (
+	_ clientset.Interface = &Clientset{}
+	_ testing.FakeClient  = &Clientset{}
+)
 
 // MinioV2 retrieves the MinioV2Client
 func (c *Clientset) MinioV2() miniov2.MinioV2Interface {
 	return &fakeminiov2.FakeMinioV2{Fake: &c.Fake}
+}
+
+// StsV1alpha1 retrieves the StsV1alpha1Client
+func (c *Clientset) StsV1alpha1() stsv1alpha1.StsV1alpha1Interface {
+	return &fakestsv1alpha1.FakeStsV1alpha1{Fake: &c.Fake}
+}
+
+// StsV1beta1 retrieves the StsV1beta1Client
+func (c *Clientset) StsV1beta1() stsv1beta1.StsV1beta1Interface {
+	return &fakestsv1beta1.FakeStsV1beta1{Fake: &c.Fake}
 }
